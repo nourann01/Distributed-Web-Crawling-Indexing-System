@@ -1,0 +1,4 @@
+__pycache__/
+.venv/
+search_index_*/
+*.pyc
