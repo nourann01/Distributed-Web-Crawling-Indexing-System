@@ -1,8 +1,8 @@
-from mpi4py import MPI
 import time
 import logging
 import json
 import os
+import boto3
 from datetime import datetime
 from whoosh.index import create_in, open_dir
 from whoosh.fields import Schema, TEXT, ID, DATETIME
@@ -12,16 +12,19 @@ import whoosh.index as index
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - Indexer - %(levelname)s - %(message)s')
 
+# AWS SQS Configuration
+sqs = boto3.client('sqs')
+indexer_queue_url = 'https://sqs.us-east-1.amazonaws.com/969510159350/indexer-queue.fifoo'
+result_queue_url = 'https://sqs.us-east-1.amazonaws.com/969510159350/result-queue.fifo'
+
 def indexer_process():
     """
     Process for an indexer node.
     Receives web page content, indexes it, and handles search queries (basic).
     """
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-    
-    logging.info(f"Indexer node started with rank {rank} of {size}")
+    rank = 1  # Define your rank for logging purposes
+
+    logging.info(f"Indexer node started with rank {rank}")
     
     # Initialize index
     index_dir = f"search_index_{rank}"
@@ -50,34 +53,27 @@ def indexer_process():
     start_time = time.time()
     
     while True:
-        status = MPI.Status()
+        # Receive content data from the indexer queue
+        response = sqs.receive_message(
+            QueueUrl=indexer_queue_url,
+            AttributeNames=['All'],
+            MaxNumberOfMessages=1,
+            WaitTimeSeconds=10
+        )
         
-        try:
-            # Receive content from crawlers or termination signal from master
-            content_data = comm.recv(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG, status=status)
-            source_rank = status.Get_source()
-            received_tag = status.Get_tag()
+        if 'Messages' in response:
+            message = response['Messages'][0]
+            content_data = json.loads(message['Body'])
+            receipt_handle = message['ReceiptHandle']
             
-            # Check if we received a termination signal
-            if received_tag == 999 and content_data == "TERMINATE":
-                logging.info(f"Indexer {rank} received shutdown signal. Exiting.")
-                break
-                
-            # Only process content with the expected tag (2)
-            if received_tag != 2:
-                logging.warning(f"Indexer {rank} received unexpected tag {received_tag}. Ignoring.")
-                continue
-                
-            logging.info(f"Indexer {rank} received content from Crawler {source_rank} to index.")
-            
-            # --- Indexing Logic ---
-            # 1. Process the received content
+            # Process the content
+            logging.info(f"Indexer {rank} received content to index.")
             if isinstance(content_data, dict):
                 # Extract data fields
                 url = content_data.get("url", "unknown")
                 title = content_data.get("title", "No Title")
                 content = content_data.get("content", "")
-                crawled_by = str(content_data.get("crawled_by", source_rank))
+                crawled_by = str(content_data.get("crawled_by", rank))
                 
                 # Convert timestamp or use current time
                 try:
@@ -85,10 +81,8 @@ def indexer_process():
                 except (ValueError, TypeError):
                     timestamp = datetime.now()
                 
-                # 2. Update the search index
+                # Update the search index
                 writer = idx.writer()
-                
-                # Update document if it exists, otherwise add new
                 writer.update_document(
                     url=url,
                     title=title,
@@ -96,9 +90,26 @@ def indexer_process():
                     crawled_by=crawled_by,
                     timestamp=timestamp
                 )
-                
                 writer.commit()
                 indexed_count += 1
+                
+                # Send result to result-queue.fifo
+                result_msg = {
+                    "indexed_url": url,
+                    "indexed_count": indexed_count,
+                    "indexer_rank": rank
+                }
+                sqs.send_message(
+                    QueueUrl=result_queue_url,
+                    MessageBody=json.dumps(result_msg),
+                    MessageGroupId='indexing'
+                )
+                
+                # Delete message from queue after processing
+                sqs.delete_message(
+                    QueueUrl=indexer_queue_url,
+                    ReceiptHandle=receipt_handle
+                )
                 
                 # Periodic performance reporting
                 if indexed_count % 10 == 0:
@@ -107,31 +118,12 @@ def indexer_process():
                     logging.info(f"Indexer {rank} performance: {indexed_count} documents indexed, {rate:.2f} docs/sec")
                 
                 logging.info(f"Indexer {rank} indexed content from URL: {url}")
-                
-                # Send status update to master
-                status_msg = {
-                    "indexed_url": url,
-                    "indexed_count": indexed_count,
-                    "indexer_rank": rank
-                }
-                comm.send(status_msg, dest=0, tag=99)  # Send status update to master (tag 99)
             else:
                 logging.warning(f"Indexer {rank} received non-dictionary content. Skipping.")
-            
-        except Exception as e:
-            logging.error(f"Indexer {rank} error indexing content from rank {source_rank}: {e}")
-            error_msg = f"Indexer {rank} - Error indexing: {str(e)}"
-            comm.send(error_msg, dest=0, tag=999)  # Report error to master (tag 999)
+        
+        # Optionally, handle search queries here from the master node (not implemented)
     
-    # Final reporting before shutdown
     logging.info(f"Indexer {rank} shutting down. Indexed {indexed_count} documents total.")
-    
-    # Optionally: implement a function to handle search queries from master or other nodes
-    def handle_search_query(query_string):
-         with idx.searcher() as searcher:
-             query = QueryParser("content", idx.schema).parse(query_string)
-             results = searcher.search(query, limit=10)
-             return [{"url": r["url"], "title": r["title"]} for r in results]
 
 if __name__ == '__main__':
     indexer_process()

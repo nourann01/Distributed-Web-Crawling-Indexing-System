@@ -2,3 +2,5 @@ __pycache__/
 .venv/
 search_index_*/
 *.pyc
+test_mpi.py
+testing.py
