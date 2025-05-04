@@ -11,7 +11,7 @@ import hashlib
 sqs = boto3.client('sqs', region_name='us-east-1')
 crawler_queue_url = 'https://sqs.us-east-1.amazonaws.com/969510159350/crawler-queue.fifo'
 indexer_queue_url = 'https://sqs.us-east-1.amazonaws.com/969510159350/indexer-queue.fifo'
-result_queue_url = 'https://sqs.us-east-1.amazonaws.com/969510159350/result-queue.fifo'
+crawler_result_queue_url = 'https://sqs.us-east-1.amazonaws.com/969510159350/crawler-result-queue.fifo'
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - Crawler - %(levelname)s - %(message)s')
@@ -65,19 +65,34 @@ def receive_task():
             logging.error(f"Malformed task: {e}")
     return None
 
-def send_result(payload):
-    sqs.send_message(
-        QueueUrl=result_queue_url,
-        MessageBody=json.dumps(payload),
-        MessageGroupId='1'
-    )
+def send_urls_to_crawler_queue(urls):
+    for url in urls:
+        url_hash = hashlib.sha256(url.encode()).hexdigest()
+        sqs.send_message(
+            QueueUrl=crawler_queue_url,
+            MessageBody=json.dumps({'url': url}),
+            MessageGroupId='crawler_tasks',
+            MessageDeduplicationId=url_hash
+        )
+        logging.debug(f"Sent URL to crawler queue: {url}")
 
 def send_to_indexer(document):
     sqs.send_message(
         QueueUrl=indexer_queue_url,
         MessageBody=json.dumps(document),
-        MessageGroupId='1'
+        MessageGroupId='indexer_tasks',
+        MessageDeduplicationId=document['url_hash']
     )
+    logging.info(f"Sent document to indexer queue: {document['url']}")
+
+def send_crawl_result(payload):
+    sqs.send_message(
+        QueueUrl=crawler_result_queue_url,
+        MessageBody=json.dumps(payload),
+        MessageGroupId='crawler_results',
+        MessageDeduplicationId=payload['url_hash']
+    )
+    logging.info(f"Sent crawl result for: {payload['url']}")
 
 def generate_url_hash(url):
     return hashlib.sha256(url.encode()).hexdigest()
@@ -102,8 +117,9 @@ def crawler_process():
 
         response = fetch_page(url)
         if not response:
-            send_result({
+            send_crawl_result({
                 "url": url,
+                "url_hash": generate_url_hash(url),
                 "status": "error",
                 "error": "Failed to fetch"
             })
@@ -117,26 +133,33 @@ def crawler_process():
         title, content = parse_html(html)
         extracted_urls = extract_urls(url, html)
 
+        # Send new URLs back to crawler queue
+        send_urls_to_crawler_queue(extracted_urls)
+
+        # Create document for indexer
+        url_hash = generate_url_hash(url)
         doc = {
             "url": url,
-            "url_hash": generate_url_hash(url),
+            "url_hash": url_hash,
             "title": title,
             "content": content[:1000],
             "timestamp": timestamp
         }
 
+        # Send document to indexer queue
         send_to_indexer(doc)
 
+        # Send crawl result to crawler result queue
         result_payload = {
             "url": url,
-            "url_hash": doc["url_hash"],
+            "url_hash": url_hash,
             "status": "success",
             "status_code": status_code,
             "content_length": content_length,
-            "extracted_urls": extracted_urls,
+            "extracted_urls_count": len(extracted_urls),
             "timestamp": timestamp
         }
-        send_result(result_payload)
+        send_crawl_result(result_payload)
 
         time.sleep(1)  # optional throttle for politeness
 

@@ -22,11 +22,11 @@ from bs4 import BeautifulSoup
 # AWS SQS Configuration
 sqs = boto3.client('sqs', region_name='us-east-1')
 indexer_queue_url = 'https://sqs.us-east-1.amazonaws.com/969510159350/indexer-queue.fifo'
-result_queue_url = 'https://sqs.us-east-1.amazonaws.com/969510159350/result-queue.fifo'
+indexer_result_queue_url = 'https://sqs.us-east-1.amazonaws.com/969510159350/indexer-result-queue.fifo'
 
 # RDS PostgreSQL Configuration
 DB_CONFIG = {
-    'host': 'dbdistproj.c8v2o28aq6x6.us-east-1.rds.amazonaws.com',  # Replace with your RDS endpoint
+    'host': 'dbdistproj-new.c8v2o28aq6x6.us-east-1.rds.amazonaws.com',
     'dbname': 'dbdistproj',
     'user': 'bialy',
     'password': 'midomido15',  # Use environment variables in production
@@ -407,13 +407,13 @@ def store_document_in_db(document):
         return False
 
 def send_result(result):
-    """Send indexing result to the result queue"""
+    """Send indexing result to the indexer result queue"""
     try:
         # Add message deduplication ID to ensure exactly-once delivery
         deduplication_id = hashlib.md5(json.dumps(result).encode()).hexdigest()
         
         sqs.send_message(
-            QueueUrl=result_queue_url,
+            QueueUrl=indexer_result_queue_url,
             MessageBody=json.dumps(result),
             MessageGroupId='indexing',
             MessageDeduplicationId=deduplication_id
@@ -621,7 +621,6 @@ def handle_api_request(request_data):
             "total_results": total,
             "results": results
         }
-    
     elif request_type == "popular_searches":
         limit = int(request_data.get("limit", 10))
         popular = get_popular_searches(limit)
