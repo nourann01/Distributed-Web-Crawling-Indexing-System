@@ -29,7 +29,7 @@ DB_CONFIG = {
     'host': 'dbdistproj-new.c8v2o28aq6x6.us-east-1.rds.amazonaws.com',
     'dbname': 'dbdistproj',
     'user': 'bialy',
-    'password': 'midomido15',  # Use environment variables in production
+    'password': 'midomido15', 
     'port': 5432
 }
 

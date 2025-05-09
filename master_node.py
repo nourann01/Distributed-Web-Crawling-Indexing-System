@@ -6,6 +6,7 @@ import hashlib
 import botocore.exceptions
 import argparse
 import sys
+import re
 from urllib.parse import urlparse
 
 # Parse command line arguments
@@ -13,6 +14,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Master node for web crawler')
     parser.add_argument('--urls', nargs='+', help='Seed URLs to crawl')
     parser.add_argument('--depth', type=int, default=3, help='Maximum crawl depth per domain (default: 3)')
+    parser.add_argument('--restricted', nargs='+', help='URLs or patterns to restrict from crawling')
     return parser.parse_args()
 
 # AWS SQS Client Configuration
@@ -41,11 +43,7 @@ def get_domain(url):
 def hash_url(url):
     return hashlib.md5(url.encode('utf-8')).hexdigest()
 
-def send_task_to_queue(url, depth_limit):
-    """
-    Send crawling task to the crawler SQS queue.
-    Deduplicates based on visited_urls.
-    """
+def send_task_to_queue(url, depth_limit, restricted_patterns):
     url_hash = hash_url(url)
     if url_hash in visited_urls:
         logging.debug(f"Skipping already visited URL: {url}")
@@ -57,7 +55,8 @@ def send_task_to_queue(url, depth_limit):
         'url': url,
         'depth': 0,  # Start at depth 0 for seed URLs
         'seed_domain': seed_domain,
-        'depth_limit': depth_limit
+        'depth_limit': depth_limit,
+        'restricted_patterns': restricted_patterns  # Add restricted patterns to the message
     })
 
     try:
@@ -72,10 +71,6 @@ def send_task_to_queue(url, depth_limit):
         logging.error(f"Error sending message to SQS: {e}")
 
 def receive_crawler_results():
-    """
-    Receive crawler results from the crawler-result-queue.
-    This provides status updates about crawled pages.
-    """
     try:
         response = sqs.receive_message(
             QueueUrl=crawler_result_queue_url,
@@ -102,12 +97,7 @@ def receive_crawler_results():
                 logging.error(f"Error processing crawler result message: {e}")
     return results
 
-
 def receive_indexer_results():
-    """
-    Receive indexer results from the indexer-result-queue.
-    This provides information about indexed content.
-    """
     try:
         response = sqs.receive_message(
             QueueUrl=indexer_result_queue_url,
@@ -134,27 +124,47 @@ def receive_indexer_results():
                 logging.error(f"Error processing indexer result message: {e}")
     return results
 
-def master_process(seed_urls=None, depth_limit=3):
-    """
-    Master node main process.
-    Sends seed URLs to crawler queue and monitors both crawler and indexer results.
-    
-    Parameters:
-    - seed_urls: List of URLs to start crawling from
-    - depth_limit: Maximum depth to crawl per domain
-    """
+def prepare_restricted_patterns(restricted_urls):
+    patterns = []
+    if restricted_urls:
+        for url in restricted_urls:
+            # Basic pattern conversion:
+            # - Convert * wildcard to regex wildcard
+            # - Escape special regex characters
+            # - Support for domain-only restrictions
+            
+            # Handle domain-only restrictions (without http/https prefix)
+            if not url.startswith('http'):
+                if '/' not in url and '*' not in url:
+                    # If it's just a domain, restrict the entire domain
+                    patterns.append(f"https?://{re.escape(url)}.*")
+                    continue
+            
+            # Replace * with .* but escape other regex special chars
+            pattern = url.replace('*', '__WILDCARD__')
+            pattern = re.escape(pattern)
+            pattern = pattern.replace('__WILDCARD__', '.*')
+            patterns.append(pattern)
+    return patterns
+
+def master_process(seed_urls=None, depth_limit=3, restricted_urls=None):
     logging.info("Master node started.")
 
     # Use provided seed URLs or default to a fallback
     if not seed_urls:
         seed_urls = ["https://httpbin.org/html"]
     
+    # Process restricted URLs into patterns
+    restricted_patterns = prepare_restricted_patterns(restricted_urls)
+    if restricted_patterns:
+        logging.info(f"Restricted URL patterns: {restricted_patterns}")
+    
     logging.info(f"Starting crawl with seed URLs: {seed_urls}")
     logging.info(f"Maximum crawl depth per domain: {depth_limit}")
 
     # Send all seed URLs to the crawler queue
     for url in seed_urls:
-        send_task_to_queue(url, depth_limit)
+        send_task_to_queue(url, depth_limit, restricted_patterns)
 
     # Monitor both result queues for updates
     idle_counter = 0
@@ -162,6 +172,7 @@ def master_process(seed_urls=None, depth_limit=3):
         "urls_processed": 0,
         "success": 0,
         "errors": 0,
+        "restricted": 0,  # Count of restricted URLs encountered
         "by_depth": {}, # Track stats by depth
         "by_domain": {}  # Track stats by domain
     }
@@ -190,7 +201,11 @@ def master_process(seed_urls=None, depth_limit=3):
                     crawler_stats["by_domain"][domain] = {"count": 0, "success": 0, "errors": 0}
                 crawler_stats["by_domain"][domain]["count"] += 1
                 
-                if result.get("status") == "success":
+                # Track restricted URLs
+                if result.get("status") == "restricted":
+                    crawler_stats["restricted"] += 1
+                    logging.info(f"Restricted URL skipped: {result.get('url', 'N/A')}")
+                elif result.get("status") == "success":
                     crawler_stats["success"] += 1
                     crawler_stats["by_depth"][depth]["success"] += 1
                     crawler_stats["by_domain"][domain]["success"] += 1
@@ -205,7 +220,6 @@ def master_process(seed_urls=None, depth_limit=3):
                 if crawler_stats["urls_processed"] % 10 == 0:
                     logging.info(f"Crawler stats: {crawler_stats}")
         
-        # Process indexer results
         indexer_results = receive_indexer_results()
         if indexer_results:
             idle_counter = 0
@@ -218,7 +232,6 @@ def master_process(seed_urls=None, depth_limit=3):
                 if "title" in result:
                     logging.info(f"Title: {result.get('title', 'N/A')}")
                 
-                # Only show detailed stats periodically
                 if indexer_stats["pages_indexed"] % 10 == 0:
                     logging.info(f"Indexer stats: {indexer_stats}")
         
@@ -237,7 +250,6 @@ def master_process(seed_urls=None, depth_limit=3):
         time.sleep(5)
 
 def run_interactive():
-    """Run the crawler in interactive mode, prompting for URLs and depth limit"""
     print("===== Distributed Web Crawler =====")
     
     # Get seed URLs
@@ -259,11 +271,17 @@ def run_interactive():
         except ValueError:
             print("Please enter a valid number.")
     
+    # Get restricted URLs
+    restricted_urls_input = input("Enter URLs to restrict (space-separated, leave empty to skip): ")
+    restricted_urls = [url.strip() for url in restricted_urls_input.split() if url.strip()]
+    
     print(f"\nStarting crawler with {len(seed_urls)} seed URLs and depth limit of {depth_limit}.")
+    if restricted_urls:
+        print(f"URLs matching {len(restricted_urls)} patterns will be restricted from crawling.")
     print("Press Ctrl+C to stop the crawler.")
     
     try:
-        master_process(seed_urls, depth_limit)
+        master_process(seed_urls, depth_limit, restricted_urls)
     except KeyboardInterrupt:
         print("\nCrawler stopped by user.")
 
@@ -272,7 +290,7 @@ if __name__ == '__main__':
     
     if args.urls:
         # Run with command line arguments
-        master_process(args.urls, args.depth)
+        master_process(args.urls, args.depth, args.restricted)
     else:
         # Run in interactive mode
         run_interactive()

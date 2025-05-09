@@ -1,6 +1,7 @@
 import time
 import logging
 import requests
+import re
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import boto3
@@ -62,25 +63,50 @@ def receive_task():
             depth = task_data.get('depth', 0)
             seed_domain = task_data.get('seed_domain', get_domain(url))
             depth_limit = task_data.get('depth_limit', 3)  # Default depth limit if not specified
+            # Extract restricted patterns from the task
+            restricted_patterns = task_data.get('restricted_patterns', [])
             
             receipt_handle = message['ReceiptHandle']
             sqs.delete_message(QueueUrl=crawler_queue_url, ReceiptHandle=receipt_handle)
-            return url, depth, seed_domain, depth_limit
+            return url, depth, seed_domain, depth_limit, restricted_patterns
         except Exception as e:
             logging.error(f"Malformed task: {e}")
-    return None, None, None, None
+    return None, None, None, None, None
 
 def get_domain(url):
     """Extract the domain from a URL"""
     parsed = urlparse(url)
     return parsed.netloc
 
-def send_urls_to_crawler_queue(urls, current_depth, seed_domain, depth_limit):
+def is_restricted_url(url, restricted_patterns):
+    if not restricted_patterns:
+        return False
+        
+    for pattern in restricted_patterns:
+        if re.match(pattern, url):
+            logging.info(f"URL '{url}' matches restricted pattern '{pattern}'")
+            return True
+    return False
+
+def send_urls_to_crawler_queue(urls, current_depth, seed_domain, depth_limit, restricted_patterns):
     """Send URLs to the crawler queue with depth information"""
     next_depth = current_depth + 1
     # Only send URLs that haven't exceeded the depth limit
     if next_depth <= depth_limit:
         for url in urls:
+            # Skip restricted URLs
+            if is_restricted_url(url, restricted_patterns):
+                logging.info(f"Skipping restricted URL: {url}")
+                # Send restricted status to result queue for tracking
+                send_crawl_result({
+                    "url": url,
+                    "url_hash": generate_url_hash(url),
+                    "status": "restricted",
+                    "depth": next_depth,
+                    "seed_domain": seed_domain
+                })
+                continue
+                
             url_domain = get_domain(url)
             # Only process URLs from the same domain as the seed
             if url_domain == seed_domain:
@@ -91,7 +117,8 @@ def send_urls_to_crawler_queue(urls, current_depth, seed_domain, depth_limit):
                         'url': url,
                         'depth': next_depth,
                         'seed_domain': seed_domain,
-                        'depth_limit': depth_limit
+                        'depth_limit': depth_limit,
+                        'restricted_patterns': restricted_patterns  # Pass restricted patterns to next tasks
                     }),
                     MessageGroupId='crawler_tasks',
                     MessageDeduplicationId=url_hash
@@ -127,7 +154,7 @@ def crawler_process():
     idle_counter = 0
 
     while True:
-        url, depth, seed_domain, depth_limit = receive_task()
+        url, depth, seed_domain, depth_limit, restricted_patterns = receive_task()
 
         if not url:
             idle_counter += 1
@@ -139,6 +166,19 @@ def crawler_process():
             continue
 
         idle_counter = 0
+        
+        # Check if the URL is restricted
+        if is_restricted_url(url, restricted_patterns):
+            logging.info(f"Skipping restricted URL: {url}")
+            send_crawl_result({
+                "url": url,
+                "url_hash": generate_url_hash(url),
+                "status": "restricted",
+                "depth": depth,
+                "seed_domain": seed_domain
+            })
+            continue
+            
         logging.info(f"Crawling: {url} (depth: {depth}/{depth_limit}, domain: {seed_domain})")
 
         response = fetch_page(url)
@@ -147,7 +187,9 @@ def crawler_process():
                 "url": url,
                 "url_hash": generate_url_hash(url),
                 "status": "error",
-                "error": "Failed to fetch"
+                "error": "Failed to fetch",
+                "depth": depth,
+                "seed_domain": seed_domain
             })
             continue
 
@@ -160,7 +202,7 @@ def crawler_process():
         extracted_urls = extract_urls(url, html)
 
         # Send new URLs back to crawler queue with updated depth
-        send_urls_to_crawler_queue(extracted_urls, depth, seed_domain, depth_limit)
+        send_urls_to_crawler_queue(extracted_urls, depth, seed_domain, depth_limit, restricted_patterns)
 
         # Create document for indexer
         url_hash = generate_url_hash(url)
@@ -190,8 +232,7 @@ def crawler_process():
             "seed_domain": seed_domain
         }
         send_crawl_result(result_payload)
-
-        time.sleep(1)  # optional throttle for politeness
+        time.sleep(1)  
 
 if __name__ == '__main__':
     crawler_process()
