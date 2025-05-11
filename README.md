@@ -7,9 +7,9 @@ in a new terminal, write "aws configure" (without the quotation marks)
 
 enter these credentials:
 
-access key id: AKIA6DO2PAP3OUZBG4HO
+access key id: AKIA6DO2PAP3PMFMSOOQ
 
-passkey id: TGwtW4B/xr8B45qFrUDwAAueM79Ar5BYCoDxIYFy
+passkey id: LWMPxyVW3ho8xASX1aO5fVwCtvunQsqW+J4xq6Pq
 
 region: us-east-1
 
